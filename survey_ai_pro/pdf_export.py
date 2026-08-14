@@ -1,193 +1,286 @@
-"""📄 تصدير PDF بخط عربي - يعمل على Windows و Linux"""
+"""تصدير PDF بخط عربي ودعم RTL كامل"""
 from pathlib import Path
 from typing import Dict, List, Optional
 import pandas as pd
-from fpdf import FPDF
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib.colors import HexColor, white, black
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_RIGHT, TA_CENTER
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    Image as RLImage, PageBreak
+)
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from rich.console import Console
-import urllib.request
-import os
+import re
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    HAS_ARABIC = True
+except ImportError:
+    HAS_ARABIC = False
 
 console = Console()
 
-class PDFExporter(FPDF):
-    def __init__(self, path: str = "output/report.pdf"):
-        super().__init__(orientation='P', unit='mm', format='A4')
+
+def is_arabic_word(word):
+    return bool(re.search(r'[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]', word))
+
+
+def reshape_arabic(text):
+    if not text or not HAS_ARABIC:
+        return text or ""
+    words = text.split(' ')
+    fixed_words = []
+    for word in words:
+        if is_arabic_word(word):
+            reshaped = arabic_reshaper.reshape(word)
+            fixed = get_display(reshaped)
+            fixed_words.append(fixed)
+        else:
+            fixed_words.append(word)
+    fixed_words.reverse()
+    return ' '.join(fixed_words)
+
+
+class PDFExporter:
+    def __init__(self, path="output/report.pdf"):
         self.out_path = Path(path)
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         self._font_ready = False
+        self._font_name = "ArabicFont"
         self._setup_fonts()
-        self.set_auto_page_break(auto=True, margin=20)
-        self.add_page()
+
+        self.doc = SimpleDocTemplate(
+            str(self.out_path),
+            pagesize=A4,
+            rightMargin=2*cm,
+            leftMargin=2*cm,
+            topMargin=2*cm,
+            bottomMargin=2*cm
+        )
+
+        self.story = []
+        self._setup_styles()
+        self._page_width = A4[0] - 4*cm
 
     def _setup_fonts(self):
-        """إعداد الخطوط العربية - يعمل على أي نظام"""
-        # 1. محاولة إيجاد خط عربي في النظام
         system_fonts = [
-            # Windows
             r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\tahoma.ttf",
             r"C:\Windows\Fonts\times.ttf",
-            r"C:\Windows\Fonts\calibri.ttf",
-            # Linux
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-            # macOS
-            "/System/Library/Fonts/Helvetica.ttc",
-            "/Library/Fonts/Arial.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+            "/System/Library/Fonts/GeezaPro.ttc",
         ]
 
         for fp in system_fonts:
             if Path(fp).exists():
                 try:
-                    self.add_font('Arabic', '', fp, uni=True)
-                    self.add_font('Arabic', 'B', fp, uni=True)
-                    self.set_font('Arabic', '', 12)
+                    pdfmetrics.registerFont(TTFont(self._font_name, fp))
                     self._font_ready = True
                     return
-                except Exception as e:
+                except:
                     continue
 
-        # 2. تحميل خط Amiri من الإنترنت إذا لم يُوجد
+        import urllib.request
         font_dir = Path("fonts")
         font_dir.mkdir(exist_ok=True)
         font_file = font_dir / "Amiri-Regular.ttf"
 
         if not font_file.exists():
             try:
-                console.print("[yellow]⚠️ جاري تحميل خط عربي...[/yellow]")
                 url = "https://github.com/google/fonts/raw/main/ofl/amiri/Amiri-Regular.ttf"
                 urllib.request.urlretrieve(url, str(font_file))
-            except Exception as e:
-                console.print(f"[red]⚠️ تعذر تحميل الخط: {e}[/red]")
+            except:
+                pass
 
         if font_file.exists():
             try:
-                self.add_font('Arabic', '', str(font_file), uni=True)
-                self.add_font('Arabic', 'B', str(font_file), uni=True)
-                self.set_font('Arabic', '', 12)
+                pdfmetrics.registerFont(TTFont(self._font_name, str(font_file)))
                 self._font_ready = True
                 return
             except:
                 pass
 
-        # 3. Fallback - Helvetica بدون عربي
-        console.print("[yellow]⚠️ لم يُوجد خط عربي. سيتم استخدام Helvetica (بدون عربية).[/yellow]")
-        self.set_font('Helvetica', '', 12)
+        self._font_name = "Helvetica"
         self._font_ready = False
 
-    def _safe_text(self, text: str) -> str:
-        """تأمين النص للـ PDF"""
+    def _setup_styles(self):
+        self.styles = getSampleStyleSheet()
+
+        self.styles.add(ParagraphStyle(
+            name='ArabicTitle',
+            fontName=self._font_name,
+            fontSize=20,
+            textColor=HexColor('#2E86AB'),
+            alignment=TA_CENTER,
+            spaceAfter=20,
+            leading=28,
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='ArabicHeading1',
+            fontName=self._font_name,
+            fontSize=16,
+            textColor=HexColor('#A23B72'),
+            alignment=TA_RIGHT,
+            spaceAfter=12,
+            spaceBefore=16,
+            leading=24,
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='ArabicHeading2',
+            fontName=self._font_name,
+            fontSize=13,
+            textColor=HexColor('#2E86AB'),
+            alignment=TA_RIGHT,
+            spaceAfter=10,
+            spaceBefore=12,
+            leading=20,
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='ArabicBody',
+            fontName=self._font_name,
+            fontSize=11,
+            textColor=black,
+            alignment=TA_RIGHT,
+            spaceAfter=10,
+            leading=18,
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='ArabicCaption',
+            fontName=self._font_name,
+            fontSize=9,
+            textColor=HexColor('#666666'),
+            alignment=TA_CENTER,
+            spaceAfter=12,
+            leading=14,
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='CoverText',
+            fontName=self._font_name,
+            fontSize=14,
+            textColor=HexColor('#333333'),
+            alignment=TA_CENTER,
+            spaceAfter=8,
+            leading=20,
+        ))
+
+    def _rtext(self, text):
         if not text:
             return ""
-        if self._font_ready:
-            return text
-        # إذا لم يكن هناك خط عربي، نحول إلى ASCII
-        return text.encode('ascii', 'ignore').decode('ascii') if text else ""
+        if self._font_ready and HAS_ARABIC:
+            return reshape_arabic(str(text))
+        return str(text)
 
-    def header(self):
-        if self._font_ready:
-            self.set_font('Arabic', '', 10)
-            self.set_text_color(100, 100, 100)
-            self.cell(0, 10, 'SurveyAI Pro - التقرير الإحصائي', 0, 0, 'C')
-        self.ln(5)
+    def add_title(self, text):
+        self.story.append(Paragraph(self._rtext(text), self.styles['ArabicTitle']))
+        self.story.append(Spacer(1, 0.5*cm))
 
-    def footer(self):
-        self.set_y(-15)
-        if self._font_ready:
-            self.set_font('Arabic', '', 10)
-            self.set_text_color(128, 128, 128)
-            self.cell(0, 10, f'صفحة {self.page_no()}', 0, 0, 'C')
+    def add_cover_page(self, title, subtitle, n):
+        self.story.append(Spacer(1, 4*cm))
+        self.story.append(Paragraph(self._rtext("═══════════════════════════════════════"), self.styles['CoverText']))
+        self.story.append(Paragraph(self._rtext("التقرير الإحصائي الشامل"), self.styles['CoverText']))
+        self.story.append(Paragraph(self._rtext(title), self.styles['ArabicTitle']))
+        self.story.append(Paragraph(self._rtext(f"حجم العينة: {n} فرد"), self.styles['CoverText']))
+        self.story.append(Paragraph(self._rtext("═══════════════════════════════════════"), self.styles['CoverText']))
+        self.story.append(PageBreak())
 
-    def add_title(self, text: str):
-        if self._font_ready:
-            self.set_font('Arabic', 'B', 18)
-            self.set_text_color(46, 134, 171)
-            self.cell(0, 15, self._safe_text(text), 0, 1, 'C')
-        else:
-            self.set_font('Helvetica', 'B', 18)
-            self.cell(0, 15, "SURVEY REPORT", 0, 1, 'C')
-        self.ln(5)
+    def add_heading(self, text, level=1):
+        style_name = 'ArabicHeading1' if level == 1 else 'ArabicHeading2'
+        self.story.append(Paragraph(self._rtext(text), self.styles[style_name]))
 
-    def add_heading(self, text: str):
-        if self._font_ready:
-            self.set_font('Arabic', 'B', 14)
-            self.set_text_color(162, 59, 114)
-            self.cell(0, 12, self._safe_text(text), 0, 1, 'R')
-        else:
-            self.set_font('Helvetica', 'B', 14)
-            self.cell(0, 12, text.encode('ascii','ignore').decode(), 0, 1, 'L')
-        self.ln(3)
+    def add_paragraph(self, text):
+        if not text or not text.strip():
+            return
+        self.story.append(Paragraph(self._rtext(text), self.styles['ArabicBody']))
 
-    def add_paragraph(self, text: str):
-        if self._font_ready:
-            self.set_font('Arabic', '', 11)
-            self.set_text_color(0, 0, 0)
-            self.multi_cell(0, 7, self._safe_text(text), align='R')
-        else:
-            self.set_font('Helvetica', '', 11)
-            self.multi_cell(0, 7, text.encode('ascii','ignore').decode(), align='L')
-        self.ln(3)
+    def add_caption(self, text):
+        self.story.append(Paragraph(self._rtext(text), self.styles['ArabicCaption']))
 
-    def add_caption(self, text: str):
-        """شرح/تسمية توضيحية للصور والجداول"""
-        if self._font_ready:
-            self.set_font('Arabic', 'I', 10)
-            self.set_text_color(80, 80, 80)
-            self.multi_cell(0, 6, self._safe_text(text), align='R')
-        self.ln(2)
+    def add_table(self, df, title=None):
+        if title:
+            self.add_heading(title, level=2)
 
-    def add_table(self, df: pd.DataFrame, title: str = None):
-        if title and self._font_ready:
-            self.add_heading(title)
+        if df.empty:
+            return
 
-        self.set_font('Arabic' if self._font_ready else 'Helvetica', 'B', 9)
+        headers = [self._rtext(str(col)) for col in df.columns]
+        data = [headers]
 
-        col_widths = []
-        for col in df.columns:
-            max_len = max(len(str(v)) for v in df[col]) if not df.empty else len(str(col))
-            max_len = max(max_len, len(str(col)))
-            col_widths.append(min(max_len * 3 + 5, 50))
-
-        total = sum(col_widths)
-        if total > 190:
-            scale = 190 / total
-            col_widths = [w * scale for w in col_widths]
-
-        # رأس الجدول
-        self.set_fill_color(46, 134, 171)
-        self.set_text_color(255, 255, 255)
-        for i, col in enumerate(df.columns):
-            txt = self._safe_text(str(col)) if self._font_ready else str(col)[:20]
-            self.cell(col_widths[i], 8, txt, 1, 0, 'C', True)
-        self.ln()
-
-        # البيانات
-        self.set_font('Arabic' if self._font_ready else 'Helvetica', '', 9)
-        self.set_text_color(0, 0, 0)
-        fill = False
         for _, row in df.iterrows():
-            if fill:
-                self.set_fill_color(240, 240, 240)
-            else:
-                self.set_fill_color(255, 255, 255)
-            for i, val in enumerate(row):
+            row_data = []
+            for val in row:
                 text = f"{val:.3f}" if isinstance(val, float) else str(val)
-                if not self._font_ready:
-                    text = text.encode('ascii', 'ignore').decode()[:20]
-                self.cell(col_widths[i], 7, text[:25], 1, 0, 'C', True)
-            self.ln()
-            fill = not fill
-        self.ln(5)
+                row_data.append(self._rtext(text))
+            data.append(row_data)
 
-    def add_image(self, path: str, width: float = 180, caption: str = None):
-        if Path(path).exists():
-            self.image(str(path), x=(210-width)/2, w=width)
-            self.ln(2)
-            if caption:
-                self.add_caption(caption)
-            self.ln(3)
+        n_cols = len(df.columns)
+        available_width = self._page_width
+        col_width = available_width / n_cols
+        col_widths = [col_width] * n_cols
 
-    def save(self) -> str:
-        self.output(str(self.out_path))
-        console.print(f"[green]✅ PDF: {self.out_path}[/green]")
-        return str(self.out_path)
+        table = Table(data, colWidths=col_widths, repeatRows=1)
+
+        style_commands = [
+            ('BACKGROUND', (0, 0), (-1, 0), HexColor('#2E86AB')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), white),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), self._font_name),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('BACKGROUND', (0, 1), (-1, -1), white),
+            ('TEXTCOLOR', (0, 1), (-1, -1), black),
+            ('FONTNAME', (0, 1), (-1, -1), self._font_name),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#CCCCCC')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]
+
+        for i in range(1, len(data)):
+            if i % 2 == 0:
+                style_commands.append(('BACKGROUND', (0, i), (-1, i), HexColor('#F5F5F5')))
+
+        table.setStyle(TableStyle(style_commands))
+        self.story.append(table)
+        self.story.append(Spacer(1, 0.3*cm))
+
+    def add_image(self, path, width=14, caption=None):
+        if not Path(path).exists():
+            return
+
+        max_width = self._page_width
+        img_width = min(width * cm, max_width)
+
+        img = RLImage(str(path), width=img_width)
+        img.hAlign = 'CENTER'
+        self.story.append(img)
+        self.story.append(Spacer(1, 0.2*cm))
+
+        if caption:
+            self.add_caption(caption)
+
+    def add_page_break(self):
+        self.story.append(PageBreak())
+
+    def add_spacer(self, height=0.5):
+        self.story.append(Spacer(1, height*cm))
+
+    def save(self):
+        try:
+            self.doc.build(self.story)
+            console.print(f"[green]PDF: {self.out_path}[/green]")
+            return str(self.out_path)
+        except Exception as e:
+            console.print(f"[red]خطأ PDF: {e}[/red]")
+            raise
